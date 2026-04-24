@@ -1,0 +1,20 @@
+# 空目录
+
+本目录用于存放儒家视角 Skill 的一手/二手材料原始文件。
+当前无文件，目录结构已创建以保持完整性。
+
+如需添加原始文献（如经典扫描件、论文PDF等），请按以下子目录组织：
+
+```
+sources/
+├── classics/          # 一手经典原始文献
+│   ├── lunyu.txt
+│   ├── mengzi.txt
+│   └── liji/
+├── modern/            # 现代研究文献
+│   ├── feng-youlan/
+│   ├── liang-shuming/
+│   └── mou-zongsan/
+└── critiques/         # 外部批评文献
+    └── modern-critique/
+```
