@@ -1,5 +1,20 @@
 # DialecticEngine
 
+## Why DialecticEngine?
+
+Compared with existing frameworks:
+
+- **LangChain**：流程驱动（Workflow），缺少动态决策能力
+- **AutoGPT**：Agent能力强，但稳定性与可控性较差
+- **本项目**：引入"策略路由 + 多维评分"，实现可控的多Agent协同决策
+
+核心优势：
+- **可解释**（决策路径可追踪）
+- **可控**（规则+评分约束）
+- **可扩展**（Skill模块化）
+
+---
+
 [English](#english) | [中文](#中文)
 
 ---
@@ -21,12 +36,38 @@
 
 ### Technical Architecture
 
-```
-User Query -> PolicyRouter (Routing) -> SkillExecutor (LLM) -> Response
-                |                        |
-         Feature Extraction         Load Skill Context
-         Rule Matching              DeepSeek Chat
-         Feedback Adjustment          Streaming/Sync Output
+```mermaid
+flowchart TD
+    A[User Query] --> B[PolicyRouter]
+    B --> C{Execution Mode}
+    C -->|SINGLE| D[Single Skill Executor]
+    C -->|MULTI| E[Multi-Skill Fusion]
+    C -->|DEBATE| F[Multi-Skill Debate]
+
+    D --> G{Confidence Check}
+    E --> G
+    F --> G
+
+    G -->|Low| H[Fallback Manager]
+    G -->|High| I[Response Output]
+
+    H -->|Retry| B
+    H -->|Reskill| J[Skill Expansion]
+
+    D --> K[Memory System]
+    E --> K
+    F --> K
+
+    K -->|Store| L[(Milvus DB)]
+
+    J --> B
+
+    subgraph Scoring Dimensions
+        B --> M[Semantic Match]
+        B --> N[Rule Engine]
+        B --> O[Context Analysis]
+        B --> P[Feedback Learning]
+    end
 ```
 
 ### Core Modules
@@ -46,6 +87,15 @@ User Query -> PolicyRouter (Routing) -> SkillExecutor (LLM) -> Response
 - **Embedding**: BAAI/bge-base-zh-v1.5 (Chinese optimized)
 - **Framework**: LangGraph, FastAPI
 - **Language**: Python 3.10+
+
+### Use Cases
+
+| Scenario | Description | Execution Mode |
+|----------|-------------|----------------|
+| **Intelligent Customer Service** | Multi-strategy response generation (rigorous/comforting/sales) | SINGLE or DEBATE |
+| **Enterprise Knowledge Q&A** | Multi-perspective analysis and suggestion generation | MULTI |
+| **Decision Support System** | Result comparison under different strategies | MULTI |
+| **Multi-Agent Collaborative Tasks** | Planning / Analysis / Execution coordination | DEBATE |
 
 ### Quick Start
 
@@ -132,6 +182,22 @@ DialecticEngine/
 3. **Chain Multi-perspective Interaction**: Perspectives see each other's views for true intellectual collision
 4. **Confidence-adaptive Fallback**: Automatic fallback on low confidence to ensure answer quality
 
+### Evaluation
+
+| Metric | Description | Target |
+|--------|-------------|--------|
+| **Routing Accuracy** | Correct skill selection rate for single-perspective queries | > 85% |
+| **Multi-perspective Fusion** | Quality score for chain fusion responses (1-5) | > 4.0 |
+| **Response Stability** | Variance in repeated query responses | < 15% |
+| **Fallback Effectiveness** | Success rate of fallback recovery | > 70% |
+
+### Limitations
+
+- **Multi-Agent Conflicts**: In DEBATE mode, conflicting perspectives may require additional adjudication overhead
+- **Routing Weight Sensitivity**: System performance depends on proper tuning of scoring weights (semantic/rule/context/feedback)
+- **Memory Bias**: Historical decisions stored in Milvus may introduce recency bias in similarity search
+- **Skill Coverage**: Response quality degrades for queries outside defined philosophical perspective domains
+
 ---
 
 # 中文
@@ -148,12 +214,38 @@ DialecticEngine/
 
 ### 技术架构
 
-```
-用户问题 -> PolicyRouter (路由决策) -> SkillExecutor (LLM 生成) -> 回答
-                |                         |
-         特征提取 + 评分           加载 Skill 上下文
-         规则匹配 + 融合           DeepSeek Chat
-         历史反馈调整               流式/同步输出
+```mermaid
+flowchart TD
+    A[用户问题] --> B[PolicyRouter]
+    B --> C{执行模式}
+    C -->|SINGLE 单视角| D[单一视角执行]
+    C -->|MULTI 链式融合| E[多视角融合]
+    C -->|DEBATE 辩论| F[多视角辩论]
+
+    D --> G{置信度检测}
+    E --> G
+    F --> G
+
+    G -->|低| H[Fallback 管理器]
+    G -->|高| I[响应输出]
+
+    H -->|重试| B
+    H -->|扩展| J[Skill 扩展]
+
+    D --> K[记忆系统]
+    E --> K
+    F --> K
+
+    K -->|存储| L[(Milvus 向量库)]
+
+    J --> B
+
+    subgraph 评分维度
+        B --> M[语义匹配]
+        B --> N[规则引擎]
+        B --> O[上下文分析]
+        B --> P[反馈学习]
+    end
 ```
 
 ### 核心模块
@@ -173,6 +265,15 @@ DialecticEngine/
 - **Embedding**: BAAI/bge-base-zh-v1.5 (中文优化)
 - **框架**: LangGraph, FastAPI
 - **语言**: Python 3.10+
+
+### 应用场景
+
+| 场景 | 描述 | 执行模式 |
+|------|------|----------|
+| **智能客服** | 多策略回复生成（严谨/安抚/销售） | SINGLE 或 DEBATE |
+| **企业知识问答** | 多视角分析与建议生成 | MULTI |
+| **决策支持系统** | 不同策略下的结果对比 | MULTI |
+| **多Agent协同任务** | 规划 / 分析 / 执行协调 | DEBATE |
 
 ### 快速开始
 
@@ -258,6 +359,22 @@ DialecticEngine/
 2. **Multi-signal 路由**：融合语义、规则、历史反馈多维信号
 3. **链式多视角交互**：视角间可见彼此观点，实现真正的思想碰撞
 4. **置信度自适应 Fallback**：低置信度自动触发，保证回答质量
+
+### 系统评估
+
+| 指标 | 描述 | 目标值 |
+|------|------|--------|
+| **路由准确率** | 单一视角查询的正确技能选择率 | > 85% |
+| **多视角融合质量** | 链式融合响应的质量评分 (1-5) | > 4.0 |
+| **响应稳定性** | 重复查询响应的方差 | < 15% |
+| **Fallback有效性** | Fallback恢复的成功率 | > 70% |
+
+### 系统局限
+
+- **多Agent冲突**：DEBATE模式下，冲突视角可能需要额外的裁决开销
+- **路由权重敏感性**：系统性能依赖评分权重的合理调优（语义/规则/上下文/反馈）
+- **记忆偏差**：存储在Milvus中的历史决策可能在相似性检索中引入近因偏差
+- **Skill覆盖范围**：超出定义的哲学视角领域时，响应质量会下降
 
 ---
 
