@@ -1,0 +1,80 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+ENV/
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov/
+.tox/
+tests/
+test_*.py
+
+# IDE
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+
+# Agent cache (third-party content)
+.agents/
+
+# IDE tools cache
+.wucai/
+
+# CI/CD
+.github/
+
+# Documentation
+*.md
+!README.md
+
+# Environment (secrets)
+.env
+.env.local
+.env.*.local
+
+# User data (privacy)
+data/memory/
+
+# Pre-processed knowledge data
+knowledge/chunks.jsonl
+
+# Skill lock file (local)
+skills-lock.json
+
+# Blog drafts
+blog_zhihu.md
+
+# Temporary fix scripts
+_b64_writer.py
+_fix2.py
+_fix3.py
+_fix_chinese.py
+_scan_q.py
+_write_docker_tools.py
+
+# Debug server
+frontend/debug_server.py
+
+# Docker Compose (contains deployment config)
+docker-compose.yml
+
+# Local data
+*.db
+*.sqlite
+
+# Misc
+.DS_Store
+Thumbs.db

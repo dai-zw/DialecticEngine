@@ -421,8 +421,8 @@ class RoutingDecision:
     debate_pairs: Optional[list[tuple[str, str]]]  # 辩论配对 (用于DEBATE模式)
 
     # 可解释性 (required)
-    explanation: str                     # 对用户的解释
-    trace: dict[str, Any]                # 完整trace
+    explanation: str = ""                      # 对用户的解释
+    trace: dict[str, Any] = field(default_factory=dict)  # 完整trace
 
     # 长期记忆上下文 (optional)
     memory_context: dict[str, Any] = field(default_factory=dict)

@@ -7,6 +7,7 @@ DialecticEngine Milvus Collection 创建脚本
 """
 
 import logging
+import os
 from pymilvus import (
     connections,
     Collection,
@@ -22,9 +23,9 @@ from pymilvus.exceptions import MilvusException
 # 配置
 # ============================================================
 
-MILVUS_HOST = "localhost"
-MILVUS_PORT = "19530"
-MILVUS_TOKEN = "root:Milvus"
+MILVUS_HOST = os.environ.get("MILVUS_HOST", "localhost")
+MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
+MILVUS_TOKEN = os.environ.get("MILVUS_TOKEN", "root:Milvus")
 
 COLLECTION_MEMORIES = "dialectic_memories"
 COLLECTION_META = "dialectic_meta"

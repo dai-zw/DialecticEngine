@@ -20,6 +20,9 @@ DialecticEngine - 主入口
 
 from __future__ import annotations
 
+import concurrent.futures
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,11 +38,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from policy_router import PolicyRouter, RouterConfig, create_router, RoutingDecision
 from src.utils.integrations.deepseek_integration import DeepSeekChat
+from memory_store import MemoryStore
 
 # 长期记忆配置（可选）
 LONG_TERM_MEMORY_ENABLED = os.environ.get("LONG_TERM_MEMORY_ENABLED", "false").lower() in ("1", "true", "yes")
@@ -55,6 +61,30 @@ logger = logging.getLogger(__name__)
 
 class SkillExecutor:
     """根据 RoutingDecision 的 execution_plan 调用对应 Skill 生成回答。"""
+
+    SKILL_NAME_MAP = {
+        "rujia-perspective": "儒家",
+        "daojia-perspective": "道家",
+        "mingjia-perspective": "名家",
+        "fajia-perspective": "法家",
+        "mojia-perspective": "墨家",
+        "zonghengjia-perspective": "纵横家",
+        "yinyangjia-perspective": "阴阳家",
+        "shijia-perspective": "史家",
+        "yijia-perspective": "医家",
+        "fojia-perspective": "佛家",
+        "lixue-perspective": "理学",
+        "xinxue-perspective": "心学",
+        "bingjia-perspective": "兵家",
+        "huanglao-perspective": "黄老",
+        "jingxue-perspective": "经学",
+        "nongjia-perspective": "农家",
+        "xiaoshuojia-perspective": "小说家",
+        "shushujia-perspective": "术数家",
+        "zajia-perspective": "杂家",
+        "xuanxue-perspective": "玄学",
+        "newrujia-perspective": "新儒",
+    }
 
     def __init__(self, llm: DeepSeekChat):
         self.llm = llm
@@ -96,8 +126,8 @@ class SkillExecutor:
                 "fusion_result": {"conclusion": "", "options": []},
             }
 
-        # 多视角模式使用链式交互
-        if mode == "multi" and len(selected) > 1:
+        # 多视角 / 辩论模式：链式交锋（禁止合并为单一流派回答）
+        if self._is_debate_chain_mode(decision):
             return self.execute_chain(decision, user_query, memory_context)
 
         skill_context = self._load_skills_context(selected)
@@ -144,194 +174,91 @@ class SkillExecutor:
             "fusion_result": fusion_result,
         }
 
+    def _is_debate_chain_mode(self, decision: RoutingDecision) -> bool:
+        """多个视角时启用顺序辩论链。"""
+        return (
+            len(decision.selected_skills) > 1
+            and decision.execution_mode.value in ("multi", "debate")
+        )
+
+    def _get_skill_display_name(self, skill_id: str) -> str:
+        return self.SKILL_NAME_MAP.get(skill_id, skill_id.replace("-perspective", ""))
+
+    def _get_ordered_skills(
+        self, decision: RoutingDecision
+    ) -> tuple[list[str], dict[str, float]]:
+        """按 execution_plan 的步骤顺序确定发言先后（而非按权重倒序）。"""
+        selected = decision.selected_skills
+        weights: dict[str, float] = {}
+        ordered: list[str] = []
+
+        if decision.execution_plan:
+            steps = sorted(
+                [s for s in decision.execution_plan if s.get("action") == "invoke_skill"],
+                key=lambda s: s.get("step", 0),
+            )
+            seen: set[str] = set()
+            for step in steps:
+                skill_id = step.get("skill_id")
+                if not skill_id or skill_id in seen:
+                    continue
+                ordered.append(skill_id)
+                seen.add(skill_id)
+                weights[skill_id] = step.get("weight", 1.0 / max(len(selected), 1))
+
+        if not ordered:
+            ordered = list(selected)
+            default_w = 1.0 / max(len(ordered), 1)
+            for skill_id in ordered:
+                weights[skill_id] = default_w
+
+        for skill_id in selected:
+            if skill_id not in ordered:
+                ordered.append(skill_id)
+                weights[skill_id] = 1.0 / max(len(selected), 1)
+
+        return ordered, weights
+
+    def _create_debate_orchestrator(self):
+        from debate_orchestrator import DebateOrchestrator
+
+        return DebateOrchestrator(
+            llm=self.llm,
+            load_skill_context=self._load_skills_context,
+            get_skill_display_name=self._get_skill_display_name,
+            get_skill_focus=self._get_skill_focus,
+            all_skill_ids=list(self.SKILL_NAME_MAP.keys()),
+        )
+
     def execute_chain(
         self,
         decision: RoutingDecision,
         user_query: str,
         memory_context: str = "",
     ) -> dict[str, Any]:
-        """链式执行多个 Skill，实现真正的跨 skill 交互。
-        
-        每个 skill 依次发言，后面的 skill 会看到前面 skill 的发言，
-        从而实现真正的观点碰撞和融合。
-        """
-        selected = decision.selected_skills
-        
-        # 按权重排序（从高到低）
-        skill_weights = {}
-        if decision.execution_plan:
-            for step in decision.execution_plan:
-                if step.get("action") == "invoke_skill":
-                    skill_id = step.get("skill_id")
-                    weight = step.get("weight", 1.0 / len(selected))
-                    skill_weights[skill_id] = weight
-        
-        # 按权重降序排列，确保最重要的 skill 先发言
-        sorted_skills = sorted(selected, key=lambda s: skill_weights.get(s, 0), reverse=True)
-        
-        # 收集链式对话历史
-        chain_history: list[dict] = []
-        
-        for i, skill_id in enumerate(sorted_skills):
-            is_last = (i == len(sorted_skills) - 1)
-            
-            # 构建当前 skill 的 prompt
-            prompt = self._build_chain_prompt(
-                user_query=user_query,
-                decision=decision,
-                current_skill=skill_id,
-                chain_history=chain_history,
-                is_last_skill=is_last,
-                memory_context=memory_context,
-            )
-            
-            try:
-                response = self.llm.invoke(prompt)
-                response_text = response.content if hasattr(response, 'content') else str(response)
-            except Exception as e:
-                logger.warning(f"LLM 调用失败 ({skill_id}): {e}")
-                response_text = f"[LLM 调用失败: {str(e)[:100]}]"
-            
-            # 添加到对话历史
-            chain_history.append({
-                "skill_id": skill_id,
-                "response": response_text,
-                "weight": skill_weights.get(skill_id, 0),
-            })
-        
-        # 合并所有输出为最终响应
-        final_response = self._merge_chain_responses(chain_history, sorted_skills)
-        
-        # 构建 skill_outputs
-        skill_outputs = [
-            {
-                "skill_id": item["skill_id"],
-                "response": item["response"],
-                "weight": item["weight"],
-            }
-            for item in chain_history
-        ]
-        
+        """大脑主持：派单、阶段总结、异议申辩、最终综合。"""
+        ordered_skills, skill_weights = self._get_ordered_skills(decision)
+        orchestrator = self._create_debate_orchestrator()
+        result = orchestrator.run(
+            user_query=user_query,
+            ordered_skills=ordered_skills,
+            skill_weights=skill_weights,
+            memory_context=memory_context,
+            mode=decision.execution_mode.value,
+            callback=None,
+        )
+        synthesis = result.get("synthesis", "")
         return {
-            "skill_ids": selected,
-            "mode": "multi",
-            "response": final_response,
+            **result,
             "execution_plan": decision.execution_plan,
             "reasoning": decision.reasoning,
             "confidence": decision.confidence,
-            "skill_outputs": skill_outputs,
-            "chain_history": chain_history,  # 保存完整链式历史用于调试
             "fusion_result": {
-                "conclusion": self._extract_conclusion(final_response),
-                "options": self._extract_options(final_response),
+                "conclusion": self._extract_conclusion(synthesis or result["response"]),
+                "options": self._extract_options(synthesis or result["response"]),
                 "reasoning": decision.reasoning,
             },
         }
-
-    def _build_chain_prompt(
-        self,
-        user_query: str,
-        decision: RoutingDecision,
-        current_skill: str,
-        chain_history: list[dict],
-        is_last_skill: bool,
-        memory_context: str = "",
-    ) -> str:
-        """构建链式交互的 prompt。
-        
-        Args:
-            user_query: 用户问题
-            decision: 路由决策
-            current_skill: 当前要执行的 skill
-            chain_history: 之前的对话历史
-            is_last_skill: 是否是最后一个 skill
-            memory_context: 长期记忆上下文
-        """
-        skill_name_map = {
-            "rujia-perspective": "儒家",
-            "daojia-perspective": "道家",
-            "mingjia-perspective": "名家",
-            "fajia-perspective": "法家",
-            "mojia-perspective": "墨家",
-            "zonghengjia-perspective": "纵横家",
-            "yinyangjia-perspective": "阴阳家",
-            "shijia-perspective": "史家",
-            "yijia-perspective": "医家",
-            "fojia-perspective": "佛家",
-            "lixue-perspective": "理学",
-            "xinxue-perspective": "心学",
-            "bingjia-perspective": "兵家",
-            "huanglao-perspective": "黄老",
-            "jingxue-perspective": "经学",
-            "nongjia-perspective": "农家",
-            "xiaoshuojia-perspective": "小说家",
-            "shushujia-perspective": "术数家",
-            "zajia-perspective": "杂家",
-            "xuanxue-perspective": "玄学",
-            "newrujia-perspective": "新儒",
-        }
-        
-        current_skill_name = skill_name_map.get(current_skill, current_skill)
-        
-        # 加载当前 skill 的上下文
-        skill_context = self._load_skills_context([current_skill])
-        
-        # 构建对话历史部分
-        history_section = ""
-        if chain_history:
-            history_lines = ["\n## 前面的讨论\n"]
-            for item in chain_history:
-                skill_n = skill_name_map.get(item["skill_id"], item["skill_id"])
-                history_lines.append(f"**{skill_n}** 说：\n{item['response']}\n")
-            history_section = "\n".join(history_lines)
-        
-        # 构建指令
-        if is_last_skill:
-            instruction = f"""你是**{current_skill_name}**视角的代言人。
-
-请综合前面的讨论，从{current_skill_name}的核心立场出发，给出：
-1. 对前面各视角观点的评价和回应
-2. {current_skill_name}的独特贡献和超越性见解
-3. 给用户的具体行动建议
-
-回答要有{current_skill_name}的特色，体现其核心思维方式。"""
-        else:
-            instruction = f"""你是**{current_skill_name}**视角的代言人。
-
-请从{current_skill_name}的核心立场出发，针对用户问题给出深入的洞察和建议。
-{current_skill_name}强调{self._get_skill_focus(current_skill)}。
-        
-回答要点：
-1. {current_skill_name}如何看待这个问题
-2. 从{current_skill_name}角度的具体建议
-3. 体现{current_skill_name}的智慧和洞见"""
-        
-        prompt = f"""你是一位深谙中国传统哲学的思考顾问，正在参与一场多视角的思想对话。
-
-【用户问题】
-{user_query}
-
-【当前视角】
-{current_skill_name}
-
-【{current_skill_name}的思维框架】
-{skill_context}
-
-{history_section}
-
-【你的任务】
-{instruction}
-"""
-        
-        # 添加长期记忆
-        if memory_context:
-            prompt += f"""
-\n{'='*40}
-【历史回答参考】
-{memory_context}
-"""
-        
-        return prompt
 
     def _get_skill_focus(self, skill_id: str) -> str:
         """获取各 skill 的核心关注点描述"""
@@ -349,48 +276,18 @@ class SkillExecutor:
             "bingjia-perspective": "战略全局、知己知彼、奇正相生",
             "shijia-perspective": "以史为鉴、古今贯通、历史智慧",
             "zajia-perspective": "兼容并蓄、博采众长、因时制宜",
+            "zonghengjia-perspective": "合纵连横、游说权谋、利害权衡",
+            "huanglao-perspective": "清静无为、德法并用、守雌贵柔",
+            "yijia-perspective": "悬壶济世、身心同治、阴阳调和",
+            "jingxue-perspective": "训诂考据、经世致用、守正传承",
+            "nongjia-perspective": "耕织为本、务实重农、顺天应时",
+            "xiaoshuojia-perspective": "以事寓理、体察人情、见微知著",
+            "shushujia-perspective": "象数推演、天人相应、趋吉避凶",
+            "xuanxue-perspective": "贵无崇本、得意忘言、名教自然",
         }
         return focus_map.get(skill_id, "独特智慧和洞见")
 
-    def _merge_chain_responses(
-        self,
-        chain_history: list[dict],
-        sorted_skills: list[str],
-    ) -> str:
-        """合并链式响应为最终输出"""
-        skill_name_map = {
-            "rujia-perspective": "儒家",
-            "daojia-perspective": "道家",
-            "mingjia-perspective": "名家",
-            "fajia-perspective": "法家",
-            "mojia-perspective": "墨家",
-            "zonghengjia-perspective": "纵横家",
-            "yinyangjia-perspective": "阴阳家",
-            "shijia-perspective": "史家",
-            "yijia-perspective": "医家",
-            "fojia-perspective": "佛家",
-            "lixue-perspective": "理学",
-            "xinxue-perspective": "心学",
-            "bingjia-perspective": "兵家",
-            "huanglao-perspective": "黄老",
-            "jingxue-perspective": "经学",
-            "nongjia-perspective": "农家",
-            "xiaoshuojia-perspective": "小说家",
-            "shushujia-perspective": "术数家",
-            "zajia-perspective": "杂家",
-            "xuanxue-perspective": "玄学",
-            "newrujia-perspective": "新儒",
-        }
-        
-        parts = []
-        for i, item in enumerate(chain_history):
-            skill_name = skill_name_map.get(item["skill_id"], item["skill_id"])
-            parts.append(f"### {skill_name}视角\n\n{item['response']}")
-        
-        # 如果最后一个是综合性的（通常是权重最高的），作为压轴
-        return "\n\n---\n\n".join(parts)
-
-    def execute_stream(self, decision: RoutingDecision, user_query: str, callback=None, memory_context: str = ""):
+    def execute_stream(self, decision: RoutingDecision, user_query: str, callback=None, memory_context: str = "", search_context: str = ""):
         """流式执行 Skill，边生成边输出。
 
         Args:
@@ -398,6 +295,7 @@ class SkillExecutor:
             user_query: 原始用户问题
             callback: 每个 token 输出的回调函数
             memory_context: 长期记忆上下文（历史回答参考）
+            search_context: 联网搜索结果上下文
 
         Returns:
             {
@@ -421,9 +319,9 @@ class SkillExecutor:
                 "fusion_result": {"conclusion": "", "options": []},
             }
 
-        # 多视角模式使用链式交互（非流式，因为需要等待前面的响应）
-        if mode == "multi" and len(selected) > 1:
-            return self.execute_chain_stream(decision, user_query, callback, memory_context)
+        # 多视角 / 辩论：顺序交锋 + 主持人综合
+        if self._is_debate_chain_mode(decision):
+            return self.execute_chain_stream(decision, user_query, callback, memory_context, search_context)
 
         skill_context = self._load_skills_context(selected)
 
@@ -432,6 +330,7 @@ class SkillExecutor:
             decision, 
             skill_context,
             memory_context=memory_context,
+            search_context=search_context,
         )
 
         full_response = ""
@@ -479,113 +378,29 @@ class SkillExecutor:
         user_query: str,
         callback=None,
         memory_context: str = "",
+        search_context: str = "",
     ) -> dict[str, Any]:
-        """流式链式执行多个 Skill。
-        
-        逐个 skill 发言，每个 skill 完成后通过 callback 输出，
-        用户可以看到各视角依次发言的过程。
-        """
-        selected = decision.selected_skills
-        
-        # 按权重排序
-        skill_weights = {}
-        if decision.execution_plan:
-            for step in decision.execution_plan:
-                if step.get("action") == "invoke_skill":
-                    skill_id = step.get("skill_id")
-                    weight = step.get("weight", 1.0 / len(selected))
-                    skill_weights[skill_id] = weight
-        
-        sorted_skills = sorted(selected, key=lambda s: skill_weights.get(s, 0), reverse=True)
-        
-        chain_history: list[dict] = []
-        skill_name_map = {
-            "rujia-perspective": "儒家",
-            "daojia-perspective": "道家",
-            "mingjia-perspective": "名家",
-            "fajia-perspective": "法家",
-            "mojia-perspective": "墨家",
-            "zonghengjia-perspective": "纵横家",
-            "yinyangjia-perspective": "阴阳家",
-            "shijia-perspective": "史家",
-            "yijia-perspective": "医家",
-            "fojia-perspective": "佛家",
-            "lixue-perspective": "理学",
-            "xinxue-perspective": "心学",
-            "bingjia-perspective": "兵家",
-            "huanglao-perspective": "黄老",
-            "jingxue-perspective": "经学",
-            "nongjia-perspective": "农家",
-            "xiaoshuojia-perspective": "小说家",
-            "shushujia-perspective": "术数家",
-            "zajia-perspective": "杂家",
-            "xuanxue-perspective": "玄学",
-            "newrujia-perspective": "新儒",
-        }
-        
-        for i, skill_id in enumerate(sorted_skills):
-            is_last = (i == len(sorted_skills) - 1)
-            skill_name = skill_name_map.get(skill_id, skill_id)
-            
-            # 输出当前视角标题
-            if callback:
-                callback(f"\n### {skill_name}视角\n\n")
-            
-            prompt = self._build_chain_prompt(
-                user_query=user_query,
-                decision=decision,
-                current_skill=skill_id,
-                chain_history=chain_history,
-                is_last_skill=is_last,
-                memory_context=memory_context,
-            )
-            
-            full_response = ""
-            try:
-                for chunk in self.llm.stream(prompt):
-                    chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                    full_response += chunk_text
-                    if callback:
-                        callback(chunk_text)
-            except Exception as e:
-                logger.warning(f"LLM 流式调用失败 ({skill_id}): {e}")
-                full_response = f"[LLM 调用失败: {str(e)[:100]}]"
-                if callback:
-                    callback(full_response)
-            
-            # 分隔线（非最后一个）
-            if not is_last and callback:
-                callback("\n\n---\n\n")
-            
-            chain_history.append({
-                "skill_id": skill_id,
-                "response": full_response,
-                "weight": skill_weights.get(skill_id, 0),
-            })
-        
-        final_response = self._merge_chain_responses(chain_history, sorted_skills)
-        
-        skill_outputs = [
-            {
-                "skill_id": item["skill_id"],
-                "response": item["response"],
-                "weight": item["weight"],
-            }
-            for item in chain_history
-        ]
-        
+        """流式大脑主持辩论。"""
+        ordered_skills, skill_weights = self._get_ordered_skills(decision)
+        orchestrator = self._create_debate_orchestrator()
+        result = orchestrator.run(
+            user_query=user_query,
+            ordered_skills=ordered_skills,
+            skill_weights=skill_weights,
+            memory_context=memory_context,
+            search_context=search_context,
+            mode=decision.execution_mode.value,
+            callback=callback,
+        )
+        synthesis = result.get("synthesis", "")
         return {
-            "skill_ids": selected,
-            "mode": "multi",
-            "response": final_response,
+            **result,
             "execution_plan": decision.execution_plan,
             "reasoning": decision.reasoning,
             "confidence": decision.confidence,
-            "skill_outputs": skill_outputs,
-            "chain_history": chain_history,
             "fusion_result": {
-                "conclusion": self._extract_conclusion(final_response),
-                "options": self._extract_options(final_response),
+                "conclusion": self._extract_conclusion(synthesis or result["response"]),
+                "options": self._extract_options(synthesis or result["response"]),
                 "reasoning": decision.reasoning,
             },
         }
@@ -611,6 +426,7 @@ class SkillExecutor:
         decision: RoutingDecision,
         skill_context: str,
         memory_context: str = "",
+        search_context: str = "",
     ) -> str:
         """构建发送给 LLM 的 prompt。"""
         mode_desc = {
@@ -619,7 +435,6 @@ class SkillExecutor:
             "debate": "辩论对话",
         }.get(decision.execution_mode.value, "多视角")
 
-        # 构建基础 prompt
         base_prompt = f"""你是一位深谙中国传统哲学与现代思辨方法的思考顾问。
 
 用户问题：
@@ -634,8 +449,14 @@ class SkillExecutor:
 决策说明：
 {decision.explanation}
 """
-        
-        # 如果有长期记忆上下文，添加到 prompt 中
+
+        if search_context:
+            base_prompt += f"""
+{'-' * 40}
+联网搜索结果（请结合这些最新信息进行分析，但以哲学视角为核心，搜索结果作为事实补充）：
+{search_context}
+"""
+
         if memory_context:
             base_prompt += f"""
 {'-' * 40}
@@ -817,40 +638,155 @@ class DialecticEngine:
                 return None
         return self._fallback_manager
 
+    def _build_session_memory_context(
+        self,
+        query: str,
+        session_id: str,
+    ) -> str:
+        """
+        构建会话级别的记忆上下文：
+        1. 加载同一会话的历史摘要
+        2. 根据当前 query 智能选择需要获取原文的记忆
+        3. 组合摘要 + 原文作为上下文
+
+        Args:
+            query: 当前用户问题
+            session_id: 当前会话ID
+
+        Returns:
+            格式化后的记忆上下文文本
+        """
+        # 1. 获取历史摘要
+        summary_context, referenced = MemoryStore.build_context_from_summaries(
+            session_id=session_id,
+            max_turns=5,
+        )
+
+        if not summary_context:
+            return ""
+
+        # 2. 智能判断是否需要原文
+        raw_memories = MemoryStore.retrieve_relevant_raw_memories(
+            query=query,
+            referenced_memories=referenced,
+            max_raw=2,
+        )
+
+        # 3. 构建原文上下文
+        raw_context = MemoryStore.build_raw_context(raw_memories)
+
+        # 4. 组合
+        parts = [summary_context]
+        if raw_context:
+            parts.append(raw_context)
+
+        return "\n".join(parts)
+
     def _run_with_fallback(
         self,
         query: str,
         session_id: str,
         callback=None,
-    ) -> dict[str, Any]:
+    ) -> tuple[RoutingDecision, dict[str, Any]]:
         """
-        运行 pipeline 并处理 fallback
-        
+        运行 pipeline 并处理 fallback（并行优化版本）
+
         Args:
             query: 用户问题
             session_id: 会话 ID
             callback: 流式输出的回调函数
-        
+
         Returns:
-            执行结果
+            (决策, 执行结果)
         """
-                
-        # 第一次执行
-        decision = self.router.route(
-            query=query,
-            user_id=self.user_id,
-            session_id=session_id,
-        )
-        
-                
-        # 获取长期记忆上下文
         memory_context = ""
-        if self._long_term_memory_enabled:
-            similar_memories = self.get_similar_memories(query, top_k=3)
-            if similar_memories:
-                memory_context = self._format_memory_context(similar_memories)
+        decision = None
+        result = None
+
+        # 并行执行：路由决策 + 记忆检索（长期记忆 Milvus + 会话记忆文件）
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # 提交路由任务
+            routing_future = executor.submit(
+                self.router.route,
+                query=query,
+                user_id=self.user_id,
+                session_id=session_id,
+            )
+
+            # 提交长期记忆检索任务（Milvus）
+            ltm_future = None
+            if self._long_term_memory_enabled:
+                ltm_future = executor.submit(
+                    self.get_similar_memories,
+                    query,
+                    top_k=3,
+                )
+
+            # 提交会话记忆检索任务（本地文件）
+            session_mem_future = executor.submit(
+                self._build_session_memory_context,
+                query,
+                session_id,
+            )
+
+            # 获取路由结果（5秒超时）
+            try:
+                decision = routing_future.result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                logger.warning("路由决策超时")
+                from policy_router import ExecutionMode
+                decision = RoutingDecision(
+                    decision_id=str(uuid.uuid4()),
+                    selected_skills=[],
+                    execution_mode=ExecutionMode.SINGLE,
+                    confidence=0.0,
+                    reasoning="超时，使用默认决策",
+                    skill_scores={},
+                    execution_plan=[],
+                )
+            except Exception as e:
+                logger.error(f"路由决策失败: {e}")
+                from policy_router import ExecutionMode
+                decision = RoutingDecision(
+                    decision_id=str(uuid.uuid4()),
+                    selected_skills=[],
+                    execution_mode=ExecutionMode.SINGLE,
+                    confidence=0.0,
+                    reasoning=f"错误: {str(e)[:50]}",
+                    skill_scores={},
+                    execution_plan=[],
+                )
+
+            # 获取长期记忆结果（3秒超时）
+            ltm_context = ""
+            if ltm_future:
+                try:
+                    similar_memories = ltm_future.result(timeout=3)
+                    if similar_memories:
+                        ltm_context = self._format_memory_context(similar_memories)
+                except concurrent.futures.TimeoutError:
+                    logger.warning("长期记忆检索超时，跳过")
+                except Exception as e:
+                    logger.warning(f"长期记忆检索失败: {e}")
+
+            # 获取会话记忆结果（2秒超时）
+            session_context = ""
+            try:
+                session_context = session_mem_future.result(timeout=2)
+            except concurrent.futures.TimeoutError:
+                logger.warning("会话记忆检索超时，跳过")
+            except Exception as e:
+                logger.warning(f"会话记忆检索失败: {e}")
+
+            # 组合记忆上下文：长期记忆 + 会话记忆
+            parts = []
+            if session_context:
+                parts.append(session_context)
+            if ltm_context:
+                parts.append(ltm_context)
+            memory_context = "\n\n".join(parts)
         
-                
+        # 执行 LLM 生成（必须等待）
         result = self.executor.execute_stream(
             decision,
             query,
@@ -881,6 +817,8 @@ class DialecticEngine:
         )
         
         if not fallback_decision.need_fallback:
+            # 后台存储记忆（不阻塞响应）
+            self._store_memory_async(query, decision, result, session_id)
             return decision, result
         
         # 执行 fallback
@@ -927,6 +865,8 @@ class DialecticEngine:
             result["original_skills"] = original_skills
             result["fallback_applied"] = "reskill"
         
+        # 存储记忆
+        self._store_memory_async(query, decision, result, session_id)
         return decision, result
 
     def chat(self, query: str, session_id: str | None = None) -> dict[str, Any]:
@@ -952,13 +892,7 @@ class DialecticEngine:
         result["session_id"] = session_id
         result["decision_id"] = decision.decision_id
         
-        # 存储到长期记忆
-        if self._long_term_memory_enabled:
-            self._store_to_memory(
-                query=query,
-                decision=decision,
-                response=result["response"],
-            )
+        # 注意：记忆存储已在 _run_with_fallback 中通过 _store_memory_async 后台完成
         
         return result
 
@@ -1072,24 +1006,68 @@ class DialecticEngine:
             logger.warning(f"长期记忆模块初始化失败: {e}")
             return None
 
-    def _store_to_memory(
+    def _store_memory_async(
+        self,
+        query: str,
+        decision: RoutingDecision,
+        result: dict[str, Any],
+        session_id: str = "",
+    ) -> None:
+        """
+        后台异步存储双份记忆（不阻塞响应）
+        同时保存到长期记忆(Milvus)和本地文件系统
+        """
+        def _store():
+            try:
+                # 1. 存储到本地双文件系统（原文+摘要）
+                memory_id = MemoryStore.save(
+                    session_id=session_id or str(uuid.uuid4()),
+                    user_query=query,
+                    selected_skills=decision.selected_skills,
+                    execution_mode=decision.execution_mode.value,
+                    full_response=result.get("response", ""),
+                    turns=result.get("chain_history", []),
+                    synthesis=result.get("synthesis", ""),
+                    skill_outputs=result.get("skill_outputs", []),
+                    confidence=decision.confidence,
+                    reasoning=decision.reasoning,
+                    metadata={
+                        "decision_id": decision.decision_id,
+                        "fallback_applied": result.get("fallback_applied"),
+                        "rewritten_query": result.get("rewritten_query"),
+                    },
+                )
+                logger.info(f"本地双文件记忆已保存: {memory_id}")
+
+                # 2. 存储到长期记忆(Milvus)
+                self._store_to_long_term_memory(
+                    query=query,
+                    decision=decision,
+                    response=result.get("response", ""),
+                )
+            except Exception as e:
+                logger.warning(f"异步存储记忆失败: {e}")
+
+        # 使用后台线程执行，不阻塞响应
+        threading.Thread(target=_store, daemon=True).start()
+
+    def _store_to_long_term_memory(
         self,
         query: str,
         decision: RoutingDecision,
         response: str,
     ) -> None:
-        """存储决策到长期记忆"""
+        """存储决策到 Milvus 长期记忆"""
         memory = self._get_long_term_memory()
         if memory is None:
             return
-        
+
         try:
-            # 构建 skill_scores 字典
             skill_scores = {
-                sid: score.total_score 
+                sid: score.total_score
                 for sid, score in decision.skill_scores.items()
             }
-            
+
             memory.store(
                 query=query,
                 selected_skills=decision.selected_skills,
@@ -1100,7 +1078,6 @@ class DialecticEngine:
                 user_id=self.user_id,
             )
         except Exception as e:
-            import logging
             logger.warning(f"存储长期记忆失败: {e}")
 
     def get_similar_memories(
@@ -1209,197 +1186,3 @@ def create_engine(
         skills_path=skills_path,
         top_k=top_k,
     )
-
-
-# ============================================================================
-# INTERACTIVE CLI
-# ============================================================================
-
-
-def _print_banner():
-    print()
-    print("  ┌─────────────────────────────────────────────┐")
-    print("  │         DialecticEngine · 主入口             │")
-    print("  │     多视角哲学推理 · 智能路由 · DeepSeek LLM  │")
-    print("  └─────────────────────────────────────────────┘")
-    print()
-    print("  输入你的问题，获得多视角哲学分析")
-    print("  quit / exit 退出")
-    print()
-
-
-def _safe_print(msg: str = "", end: str = "\n"):
-    try:
-        print(msg, end=end)
-    except UnicodeEncodeError:
-        print(msg.encode("utf-8", errors="replace").decode("utf-8"), end=end)
-
-
-def run_cli():
-    """交互式 CLI 入口。"""
-    import shutil
-    import sys
-
-    # --- Docker 前置检查 ---
-    from tools.docker_tools import check_docker_prereqs
-    docker_ready = check_docker_prereqs()
-    if not docker_ready:
-        _safe_print("\n  [INFO] Docker not ready. Long-term memory will be unavailable.")
-    else:
-        _safe_print("  [OK] Docker ready.")
-
-    # --- Bootstrap Agent 环境诊断 ---
-    from milvus_DB.bootstrap import run_interactive
-    bootstrap_result = run_interactive()
-
-    # 长期记忆功能需要 Milvus + Embedding 都就绪
-    memory_enabled = docker_ready and bootstrap_result.milvus_ready and bootstrap_result.embedding_configured
-    if not memory_enabled:
-        _safe_print("\n  [INFO] Long-term memory features are disabled due to missing dependencies.")
-
-    cols = shutil.get_terminal_size().columns
-    _print_banner()
-
-    engine = DialecticEngine(long_term_memory_enabled=memory_enabled)
-    session_id = str(uuid.uuid4())
-
-    while True:
-        try:
-            user_input = input(">>> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            _safe_print("\n\n再见！")
-            break
-
-        if not user_input:
-            continue
-
-        if user_input.lower() in ("quit", "exit", "q"):
-            _safe_print("感谢使用 DialecticEngine，再见！")
-            break
-
-        try:
-            # 使用带 fallback 的流式执行
-            def stream_callback(text):
-                _safe_print(text, end="")
-                sys.stdout.flush()
-            
-            decision, result = engine._run_with_fallback(user_input, session_id, callback=stream_callback)
-        except Exception as e:
-            logger.error(f"执行失败: {e}")
-            _safe_print(f"\n[系统错误] {str(e)[:200]}\n")
-            continue
-
-        mode_map = {
-            "single": "单一视角",
-            "multi": "多视角融合",
-            "debate": "辩论对话",
-        }
-        skill_name_map = {
-            "rujia-perspective": "儒家",
-            "daojia-perspective": "道家",
-            "mingjia-perspective": "名家",
-            "fajia-perspective": "法家",
-            "mojia-perspective": "墨家",
-            "zonghengjia-perspective": "纵横家",
-            "yinyangjia-perspective": "阴阳家",
-            "shijia-perspective": "史家",
-            "yijia-perspective": "医家",
-            "fojia-perspective": "佛家",
-            "lixue-perspective": "理学",
-            "xinxue-perspective": "心学",
-            "bingjia-perspective": "兵家",
-            "huanglao-perspective": "黄老",
-            "jingxue-perspective": "经学",
-            "nongjia-perspective": "农家",
-            "xiaoshuojia-perspective": "小说家",
-            "shushujia-perspective": "术数家",
-            "zajia-perspective": "杂家",
-            "xuanxue-perspective": "玄学",
-            "newrujia-perspective": "新儒",
-        }
-        mode_text = mode_map.get(decision.execution_mode.value, decision.execution_mode.value)
-        skill_names = [skill_name_map.get(s, s) for s in decision.selected_skills]
-
-        # 构建详细的选择理由说明
-        reasoning_lines = []
-        reasoning_lines.append("─" * min(cols, 80))
-        reasoning_lines.append(f"【视角选择分析】")
-        reasoning_lines.append(f"")
-        reasoning_lines.append(f"选用视角：{', '.join(skill_names)}")
-        reasoning_lines.append(f"执行模式：{mode_text}")
-        reasoning_lines.append(f"")
-
-        # 显示每个视角的得分和分析
-        if decision.selected_skills:
-            reasoning_lines.append("视角得分详情：")
-            for sid in decision.selected_skills:
-                if sid in decision.skill_scores:
-                    score = decision.skill_scores[sid]
-                    skill_name = skill_name_map.get(sid, sid)
-                    reasoning_lines.append(f"  ◆ {skill_name}：总分 {score.total_score:.2f}")
-                    reasoning_lines.append(f"      - 语义匹配：{score.semantic_score:.2f}  (关键词/概念相关度)")
-                    reasoning_lines.append(f"      - 规则匹配：{score.rule_bias_score:.2f}  (意图/领域相关度)")
-                    reasoning_lines.append(f"      - 上下文匹配：{score.context_score:.2f}  (对话连贯性)")
-                    reasoning_lines.append(f"      - 历史反馈：{score.feedback_score:.2f}  (用户偏好)")
-
-        reasoning_lines.append(f"")
-
-        # 置信度说明
-        conf = decision.confidence
-        if conf >= 0.8:
-            conf_level = "很高"
-            conf_desc = "问题特征与视角高度匹配，分析质量有信心"
-        elif conf >= 0.65:
-            conf_level = "较高"
-            conf_desc = "问题特征与视角匹配较好，分析结果可参考"
-        elif conf >= 0.5:
-            conf_level = "中等"
-            conf_desc = "存在一定不确定性，建议结合实际情况判断"
-        else:
-            conf_level = "较低"
-            conf_desc = "问题特征不够明确，建议谨慎参考或换角度思考"
-
-        reasoning_lines.append(f"【置信度】{conf:.1%} ({conf_level})")
-        reasoning_lines.append(f"  {conf_desc}")
-
-        # 选择理由
-        reasoning_lines.append(f"")
-        reasoning_lines.append(f"【选择理由】")
-        reasoning_lines.append(f"  {decision.reasoning}")
-
-        # 执行模式说明
-        reasoning_lines.append(f"")
-        reasoning_lines.append(f"【执行说明】")
-        if decision.execution_mode.value == "single":
-            reasoning_lines.append(f"  采用单一视角深入分析")
-        elif decision.execution_mode.value == "multi":
-            reasoning_lines.append(f"  采用多视角融合分析，综合各学派洞见")
-            if decision.execution_plan:
-                for step in decision.execution_plan:
-                    if step.get("action") == "invoke_skill":
-                        skill_n = skill_name_map.get(step.get("skill_id", ""), step.get("skill_id", ""))
-                        weight = step.get("weight", 0)
-                        reasoning_lines.append(f"    - {skill_n} (权重: {weight:.0%})")
-        elif decision.execution_mode.value == "debate":
-            reasoning_lines.append(f"  采用辩论对话模式，呈现对立视角的碰撞")
-            if decision.debate_pairs:
-                for pro, con in decision.debate_pairs:
-                    pro_n = skill_name_map.get(pro, pro)
-                    con_n = skill_name_map.get(con, con)
-                    reasoning_lines.append(f"    - {pro_n} vs {con_n}")
-
-        reasoning_lines.append("")
-        _safe_print("\n".join(reasoning_lines))
-
-        # 输出分隔线
-        _safe_print("─" * min(cols, 80))
-        _safe_print("回答：")
-        sys.stdout.flush()
-
-        _safe_print()  # 换行
-        _safe_print("─" * min(cols, 80))
-        _safe_print()
-
-
-if __name__ == "__main__":
-    run_cli()

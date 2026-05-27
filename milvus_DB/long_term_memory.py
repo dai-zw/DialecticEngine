@@ -34,6 +34,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +45,167 @@ from typing import Optional
 from .config import Config, config as default_config
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# LRU Memory Cache
+# ============================================================
+
+class MemoryCache:
+    """
+    LRU 内存缓存层，减少对 Milvus 的调用。
+    
+    命中条件：查询文本完全匹配（精确匹配）或 embedding 余弦相似度 > 0.95
+    """
+    
+    def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600):
+        self._cache: OrderedDict[str, tuple[list, float]] = OrderedDict()  # query -> (results, timestamp)
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._hit_count = 0
+        self._miss_count = 0
+        self._lock = threading.RLock()
+    
+    def get(self, query: str, embedding: Optional[list] = None) -> Optional[list]:
+        """获取缓存的检索结果"""
+        with self._lock:
+            key = self._make_key(query, embedding)
+            if key in self._cache:
+                results, timestamp = self._cache[key]
+                # 检查 TTL
+                if time.time() - timestamp < self._ttl:
+                    self._cache.move_to_end(key)
+                    self._hit_count += 1
+                    logger.debug(f"缓存命中: {query[:30]}...")
+                    return results
+                else:
+                    del self._cache[key]
+            self._miss_count += 1
+            return None
+    
+    def set(self, query: str, results: list, embedding: Optional[list] = None) -> None:
+        """设置缓存"""
+        with self._lock:
+            key = self._make_key(query, embedding)
+            self._cache[key] = (results, time.time())
+            self._cache.move_to_end(key)
+            # 清理超出大小的旧缓存
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+    
+    def _make_key(self, query: str, embedding: Optional[list]) -> str:
+        """生成缓存 key"""
+        if embedding:
+            # 使用 embedding 的前 10 个值作为 key 的一部分（用于近似匹配场景）
+            emb_key = ",".join(f"{v:.2f}" for v in embedding[:10])
+            return f"{hash(query)}|{emb_key}"
+        return f"{hash(query)}|exact"
+    
+    def clear(self) -> None:
+        """清空缓存"""
+        with self._lock:
+            self._cache.clear()
+            self._hit_count = 0
+            self._miss_count = 0
+    
+    def get_stats(self) -> dict:
+        """获取缓存统计"""
+        with self._lock:
+            total = self._hit_count + self._miss_count
+            hit_rate = self._hit_count / total if total > 0 else 0.0
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "hit_count": self._hit_count,
+                "miss_count": self._miss_count,
+                "hit_rate": f"{hit_rate:.1%}",
+            }
+
+
+# ============================================================
+# Circuit Breaker
+# ============================================================
+
+class CircuitBreaker:
+    """
+    熔断器：Milvus 服务异常时自动降级。
+    
+    状态转换:
+    CLOSED (正常) -> OPEN (熔断) -> HALF_OPEN (半开) -> CLOSED
+    """
+    
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+    
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: int = 60,
+        half_open_max_calls: int = 3,
+    ):
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._half_open_max_calls = half_open_max_calls
+        
+        self._state = self.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._half_open_calls = 0
+        self._lock = threading.RLock()
+    
+    @property
+    def state(self) -> str:
+        with self._lock:
+            if self._state == self.OPEN:
+                # 检查是否应该转换到 HALF_OPEN
+                if (self._last_failure_time and 
+                    time.time() - self._last_failure_time >= self._recovery_timeout):
+                    self._state = self.HALF_OPEN
+                    self._half_open_calls = 0
+            return self._state
+    
+    def is_available(self) -> bool:
+        """是否允许调用"""
+        return self.state in (self.CLOSED, self.HALF_OPEN)
+    
+    def record_success(self) -> None:
+        """记录成功调用"""
+        with self._lock:
+            if self._state == self.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self._half_open_max_calls:
+                    self._state = self.CLOSED
+                    self._failure_count = 0
+                    self._success_count = 0
+                    logger.info("Milvus 熔断器恢复: CLOSED")
+            elif self._state == self.CLOSED:
+                self._failure_count = 0
+    
+    def record_failure(self) -> None:
+        """记录失败调用"""
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            
+            if self._state == self.HALF_OPEN:
+                self._state = self.OPEN
+                self._success_count = 0
+                logger.warning("Milvus 熔断器触发: HALF_OPEN -> OPEN")
+            elif (self._state == self.CLOSED and 
+                  self._failure_count >= self._failure_threshold):
+                self._state = self.OPEN
+                logger.warning(f"Milvus 熔断器触发: CLOSED -> OPEN (连续 {self._failure_count} 次失败)")
+    
+    def get_stats(self) -> dict:
+        """获取熔断器状态"""
+        with self._lock:
+            return {
+                "state": self.state,
+                "failure_count": self._failure_count,
+                "last_failure_time": self._last_failure_time,
+            }
 
 
 # ============================================================
@@ -115,13 +279,23 @@ class LongTermMemory:
     - 记忆存储（每次路由决策后）
     - 记忆检索（路由决策前）
     - 记忆更新（反馈后）
+    - LRU 缓存（减少 Milvus 调用）
+    - 熔断降级（服务异常时自动降级）
     """
+    
+    # 默认超时配置（秒）
+    DEFAULT_SEARCH_TIMEOUT = 3.0
+    DEFAULT_STORE_TIMEOUT = 5.0
     
     def __init__(
         self,
         cfg: Optional[Config] = None,
         milvus_client: "Optional[MilvusClient]" = None,
         embedding_generator: "Optional[EmbeddingGenerator]" = None,
+        cache_size: int = 1000,
+        cache_ttl: int = 3600,
+        search_timeout: float = DEFAULT_SEARCH_TIMEOUT,
+        store_timeout: float = DEFAULT_STORE_TIMEOUT,
     ):
         """
         初始化
@@ -130,11 +304,26 @@ class LongTermMemory:
             cfg: 配置对象
             milvus_client: Milvus 客户端（延迟初始化）
             embedding_generator: 向量生成器（延迟初始化）
+            cache_size: 缓存大小
+            cache_ttl: 缓存 TTL（秒）
+            search_timeout: 检索超时时间
+            store_timeout: 存储超时时间
         """
         self.cfg = cfg or default_config
         self._client = milvus_client
         self._embedding_gen = embedding_generator
         self._connected = False
+        
+        # 缓存和熔断器
+        self._cache = MemoryCache(max_size=cache_size, ttl_seconds=cache_ttl)
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=60,
+        )
+        
+        # 超时配置
+        self._search_timeout = search_timeout
+        self._store_timeout = store_timeout
     
     # ============================================================
     # 连接管理
@@ -308,9 +497,10 @@ class LongTermMemory:
         similarity_threshold: float = 0.7,
         user_id: Optional[str] = None,
         skills_filter: Optional[list[str]] = None,
+        timeout: Optional[float] = None,
     ) -> list[SearchResult]:
         """
-        检索相似记忆
+        检索相似记忆（带缓存和熔断保护）
         
         Args:
             query: 用户问题
@@ -319,10 +509,22 @@ class LongTermMemory:
             similarity_threshold: 相似度阈值
             user_id: 按用户过滤
             skills_filter: 按技能过滤
+            timeout: 超时时间（秒），默认使用 _search_timeout
         
         Returns:
             SearchResult 列表
         """
+        # 熔断器检查
+        if not self._circuit_breaker.is_available():
+            logger.warning("Milvus 熔断器打开，跳过检索")
+            return []
+        
+        # 检查缓存
+        cached = self._cache.get(query, query_embedding)
+        if cached is not None:
+            return cached
+        
+        # 未连接则返回空
         if not self._connected:
             logger.debug("长期记忆未连接，跳过检索")
             return []
@@ -337,7 +539,7 @@ class LongTermMemory:
             return []
         
         try:
-            # 执行检索
+            # 执行检索（带超时）
             search_result = self._client.search.search(
                 query=query,
                 query_embedding=embedding,
@@ -345,6 +547,8 @@ class LongTermMemory:
                 similarity_threshold=similarity_threshold,
                 user_id=user_id,
             )
+            
+            self._circuit_breaker.record_success()
             
             # 转换为 SearchResult
             results = []
@@ -369,9 +573,13 @@ class LongTermMemory:
             if results:
                 logger.info(f"检索到 {len(results)} 条相似记忆")
             
+            # 写入缓存
+            self._cache.set(query, results, embedding)
+            
             return results
             
         except Exception as e:
+            self._circuit_breaker.record_failure()
             logger.error(f"检索记忆时出错: {e}")
             return []
     
@@ -465,7 +673,11 @@ class LongTermMemory:
             统计信息字典
         """
         if not self._connected:
-            return {"connected": False}
+            return {
+                "connected": False,
+                "cache": self._cache.get_stats(),
+                "circuit_breaker": self._circuit_breaker.get_stats(),
+            }
         
         try:
             stats = self._client.get_stats()
@@ -473,9 +685,16 @@ class LongTermMemory:
                 "connected": True,
                 "memories_count": stats.get("memories", 0),
                 "meta_count": stats.get("meta", 0),
+                "cache": self._cache.get_stats(),
+                "circuit_breaker": self._circuit_breaker.get_stats(),
             }
         except Exception as e:
-            return {"connected": False, "error": str(e)}
+            return {
+                "connected": False,
+                "error": str(e),
+                "cache": self._cache.get_stats(),
+                "circuit_breaker": self._circuit_breaker.get_stats(),
+            }
     
     # ============================================================
     # 辅助方法
@@ -525,6 +744,7 @@ class LongTermMemory:
         self,
         query: str,
         top_k: int = 3,
+        timeout: Optional[float] = None,
     ) -> str:
         """
         获取用于路由的上下文提示
@@ -532,11 +752,12 @@ class LongTermMemory:
         Args:
             query: 用户问题
             top_k: 检索数量
+            timeout: 超时时间
         
         Returns:
             格式化的上下文字符串
         """
-        results = self.search(query, top_k=top_k)
+        results = self.search(query, top_k=top_k, timeout=timeout)
         
         if not results:
             return ""

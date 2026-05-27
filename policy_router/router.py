@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -58,9 +59,13 @@ from .feedback import FeedbackEngine, create_feedback_engine
 # 长期记忆（延迟导入，避免循环依赖）
 _long_term_memory = None
 
+_LTM_ENABLED = os.environ.get("LONG_TERM_MEMORY_ENABLED", "false").lower() in ("1", "true", "yes")
+
 def _get_long_term_memory():
     """获取长期记忆模块（延迟导入）"""
     global _long_term_memory
+    if not _LTM_ENABLED:
+        return None
     if _long_term_memory is None:
         try:
             from milvus_DB.long_term_memory import get_memory, init_memory
@@ -654,6 +659,8 @@ class PolicyRouter:
             包含相似记忆的上下文字典
         """
         # 延迟初始化长期记忆
+        if not _LTM_ENABLED:
+            return {}
         if self._long_term_memory is None:
             try:
                 from milvus_DB.long_term_memory import init_memory
@@ -718,6 +725,8 @@ class PolicyRouter:
             相似决策列表
         """
         # 延迟初始化长期记忆
+        if not _LTM_ENABLED:
+            return []
         if self._long_term_memory is None:
             try:
                 from milvus_DB.long_term_memory import init_memory
@@ -770,6 +779,8 @@ class PolicyRouter:
             record_id 或 None
         """
         # 延迟初始化长期记忆
+        if not _LTM_ENABLED:
+            return None
         if self._long_term_memory is None:
             try:
                 from milvus_DB.long_term_memory import init_memory

@@ -632,3 +632,57 @@ SKILL.md：
 内在张力：传统 vs 现代
 诚实边界：不提供快速方案
 ```
+
+```
+Critic（批判者审查员） Skill 蒸馏 Prompt
+请用「女娲造人术」蒸馏一个可运行的 skill registry 条目：critic-reviewer（批判者审查员）。只输出目录内文件，不要写长篇解释。
+
+目标目录结构（必须严格生成）：
+
+skills/critic-reviewer/SKILL.md
+skills/critic-reviewer/metadata.json
+skills/critic-reviewer/references/research/
+├── 01-critic-methodology.md      # 批判性思维方法论
+├── 02-fallacy-library.md         # 逻辑谬误与认知偏差库
+├── 03-pleasing-patterns.md       # 常见AI讨好模式案例集
+├── 04-evaluation-rubrics.md      # 结构化审查框架参考
+├── 05-application-scenarios.md   # 审查触发场景与边界
+└── 06-timeline.md                # 批判性思维发展简史与近期迭代
+skills/critic-reviewer/sources/   # 一手素材存放（本地语料可选）
+skills/critic-reviewer/index/skill-card.md
+skills/critic-reviewer/index/trigger-examples.md
+
+蒸馏对象与边界：
+
+- 这是一个**功能性审查角色**，不是人物视角。它不提供解决方案，只对已有答案进行四维审查。
+- 审查维度固定为：(1) 迎合度检测 (2) 事实准确性 (3) 逻辑完整性 (4) 问题解决度。
+- 禁止审查报告中出现模糊评价（如“基本可以”），每个问题必须有具体修改建议。
+- 明确诚实边界：Critic 自身受训练数据和逻辑库限制，可能遗漏未知谬误或专业领域知识盲区。
+
+运行时要求（决定能否 discovery）：
+
+metadata.json 字段要求：
+{
+  "name": "critic-reviewer",
+  "type": "system",
+  "version": "1.0.0",
+  "description": "严格的答案审查员。对回答进行迎合度、事实、逻辑、解决度四维审查，输出结构化批评报告。用于反思链质量守门人。",
+  "trigger_keywords": ["审查答案","批判","挑刺","检查回答","critic","review","质量检查"],
+  "applicable_phases": ["reflection","fallback","debate"],
+  "input_format": {"query": "string", "answer": "string", "perspective": "string (optional)"},
+  "output_format": {"issues": "list", "suggestions": "list", "is_satisfactory": "boolean"}
+}
+
+SKILL.md 必须包含：
+- 清晰的角色定义与审查工作流（Agentic Protocol），包含：接收输入 → 四维扫描 → 标记问题 → 给修改建议 → 判定是否通过。
+- 4 个核心审查模型（对应四维），每个模型附识别特征、典型案和误判风险。
+- 至少 2 组内在张力（如：严格审查 vs 不打击创造性；指出问题 vs 保持建设性）
+- 明确“误用模式”：审查变成找茬游戏；为通过率降低标准；对高情商回复误判为讨好。
+- 审查报告输出格式严格为 JSON，格式如前所述，不接受非结构化输出。
+
+写作约束：
+
+- 全中文，指令式、冷静、精确。杜绝“我觉得”“可能有点”等模糊表述。
+- 每一条审查标准要有可验证的检查点，不是玄学。
+- 结构清晰，可被 LangChain/LangGraph 直接解析为 System Prompt 使用。
+```
